@@ -237,8 +237,16 @@ fn utf8_len(text: &str) -> usize {
     text.chars().count()
 }
 
+/// With `split_on_word`, a line may break before a leading space, or before a
+/// Chinese or Japanese character, since those languages put no spaces between words.
 fn should_split_on_word(text: &str, split_on_word: bool) -> bool {
-    !split_on_word || text.starts_with(' ')
+    !split_on_word || text.starts_with(' ') || text.chars().next().is_some_and(starts_cjk_word)
+}
+
+/// Han, hiragana or katakana, except the small kana and marks that must not start a line.
+fn starts_cjk_word(c: char) -> bool {
+    matches!(c, '\u{3041}'..='\u{30FF}' | '\u{3400}'..='\u{4DBF}' | '\u{4E00}'..='\u{9FFF}' | '\u{F900}'..='\u{FAFF}' | '\u{20000}'..='\u{3134F}')
+        && !"ぁぃぅぇぉっゃゅょゎゕゖ゛゜ゝゞ゠ァィゥェォッャュョヮヵヶ・ーヽヾ".contains(c)
 }
 
 /// Port of `whisper_wrap_segment`: wrap the last segment in `result` to
@@ -292,4 +300,68 @@ pub(crate) fn wrap_segment(vocab: &Vocab, result: &mut Vec<FullSegment>, max_len
 
     result.last_mut().unwrap().text = text;
     res
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::TokenData;
+
+    fn wrap(words: &[&str], max_len: i32) -> Vec<(String, i64, i64)> {
+        let vocab = Vocab::new(words.iter().map(|w| w.as_bytes().to_vec()).collect(), words.len() as i32);
+        let tokens = (0..words.len())
+            .map(|i| TokenData {
+                id: i as i32,
+                t0: i as i64 * 100,
+                t1: (i as i64 + 1) * 100,
+                ..TokenData::empty()
+            })
+            .collect();
+        let segment = FullSegment {
+            t0: 0,
+            t1: words.len() as i64 * 100,
+            text: words.concat(),
+            no_speech_prob: 0.0,
+            tokens,
+            speaker_turn_next: false,
+        };
+        let mut result = vec![segment];
+        wrap_segment(&vocab, &mut result, max_len, true);
+        result.into_iter().map(|s| (s.text, s.t0, s.t1)).collect()
+    }
+
+    #[test]
+    fn wraps_japanese_between_characters() {
+        let lines = wrap(&["今日", "は", "いい", "天気", "です", "ね", "。"], 4);
+        assert_eq!(
+            lines,
+            [
+                ("今日は".to_string(), 0, 200),
+                ("いい天気".to_string(), 200, 400),
+                ("ですね。".to_string(), 400, 700),
+            ]
+        );
+    }
+
+    #[test]
+    fn never_starts_a_line_with_punctuation() {
+        let lines = wrap(&["です", "ね", "。"], 3);
+        assert_eq!(lines, [("ですね。".to_string(), 0, 300)]);
+    }
+
+    #[test]
+    fn spaced_text_still_wraps_only_at_spaces() {
+        let lines = wrap(&[" hello", "world", " again"], 6);
+        assert_eq!(lines, [(" helloworld".to_string(), 0, 200), (" again".to_string(), 200, 300)]);
+    }
+
+    #[test]
+    fn cjk_word_starts() {
+        for c in ['漢', 'あ', 'ア', '𠮷'] {
+            assert!(starts_cjk_word(c), "{c}");
+        }
+        for c in ['。', '、', '！', 'ー', 'ゃ', 'ッ', 'A', '한'] {
+            assert!(!starts_cjk_word(c), "{c}");
+        }
+    }
 }
