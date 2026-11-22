@@ -233,8 +233,9 @@ pub(crate) fn compute_token_level_timestamps(
     }
 }
 
-fn utf8_len(text: &str) -> usize {
-    text.chars().count()
+/// Characters in `bytes`, counting a partial one by its lead byte, as whisper.cpp does.
+fn utf8_len(bytes: &[u8]) -> usize {
+    bytes.iter().filter(|byte| *byte & 0xC0 != 0x80).count()
 }
 
 /// With `split_on_word`, a line may break before a leading space, or before a
@@ -255,7 +256,8 @@ pub(crate) fn wrap_segment(vocab: &Vocab, result: &mut Vec<FullSegment>, max_len
     let mut segment = result.last().cloned().expect("wrap_segment on empty result");
     let mut res = 1usize;
     let mut acc = 0i32;
-    let mut text = String::new();
+    // Bytes, not strings: one character can span tokens.
+    let mut text = Vec::new();
 
     let mut i = 0usize;
     while i < segment.tokens.len() {
@@ -265,12 +267,12 @@ pub(crate) fn wrap_segment(vocab: &Vocab, result: &mut Vec<FullSegment>, max_len
             continue;
         }
         let txt = vocab.token_str(token.id);
-        let cur = utf8_len(&txt) as i32;
+        let cur = utf8_len(vocab.token_bytes(token.id)) as i32;
 
         if acc + cur > max_len && i > 0 && should_split_on_word(&txt, split_on_word) {
             {
                 let last = result.last_mut().unwrap();
-                last.text = std::mem::take(&mut text);
+                last.text = String::from_utf8_lossy(&std::mem::take(&mut text)).into_owned();
                 last.t1 = token.t0;
                 last.tokens.truncate(i);
                 last.speaker_turn_next = false;
@@ -294,11 +296,11 @@ pub(crate) fn wrap_segment(vocab: &Vocab, result: &mut Vec<FullSegment>, max_len
         }
 
         acc += cur;
-        text.push_str(&txt);
+        text.extend_from_slice(vocab.token_bytes(token.id));
         i += 1;
     }
 
-    result.last_mut().unwrap().text = text;
+    result.last_mut().unwrap().text = String::from_utf8_lossy(&text).into_owned();
     res
 }
 
@@ -308,7 +310,11 @@ mod tests {
     use crate::TokenData;
 
     fn wrap(words: &[&str], max_len: i32) -> Vec<(String, i64, i64)> {
-        let vocab = Vocab::new(words.iter().map(|w| w.as_bytes().to_vec()).collect(), words.len() as i32);
+        wrap_bytes(&words.iter().map(|w| w.as_bytes()).collect::<Vec<_>>(), max_len)
+    }
+
+    fn wrap_bytes(words: &[&[u8]], max_len: i32) -> Vec<(String, i64, i64)> {
+        let vocab = Vocab::new(words.iter().map(|w| w.to_vec()).collect(), words.len() as i32);
         let tokens = (0..words.len())
             .map(|i| TokenData {
                 id: i as i32,
@@ -320,7 +326,7 @@ mod tests {
         let segment = FullSegment {
             t0: 0,
             t1: words.len() as i64 * 100,
-            text: words.concat(),
+            text: String::new(),
             no_speech_prob: 0.0,
             tokens,
             speaker_turn_next: false,
@@ -353,6 +359,13 @@ mod tests {
     fn spaced_text_still_wraps_only_at_spaces() {
         let lines = wrap(&[" hello", "world", " again"], 6);
         assert_eq!(lines, [(" helloworld".to_string(), 0, 200), (" again".to_string(), 200, 300)]);
+    }
+
+    #[test]
+    fn keeps_a_character_split_across_tokens() {
+        // "語" is E8 AA 9E; whisper can emit it as two byte tokens.
+        let lines = wrap_bytes(&["日本".as_bytes(), b"\xE8\xAA", b"\x9E", "です".as_bytes()], 3);
+        assert_eq!(lines, [("日本語".to_string(), 0, 300), ("です".to_string(), 300, 400)]);
     }
 
     #[test]
